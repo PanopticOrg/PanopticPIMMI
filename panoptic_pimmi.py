@@ -1,14 +1,10 @@
 import os
 from enum import Enum
-from pathlib import Path
 
 from pydantic import BaseModel
 
 from panoptic.core.plugin.plugin import APlugin
-from panoptic.core.project.project import Project
-from panoptic.models import ActionContext
-from panoptic.models.results import ActionResult, Group, Notif, NotifType, Score
-from panoptic.utils import group_by_sha1
+from panoptic.models.action_models import ActionContext, ActionResult, Group, Notif, NotifType, Score
 
 from .pimmi_runner import run_clustering
 
@@ -19,12 +15,23 @@ class AlgoEnum(Enum):
 
 
 class PluginParams(BaseModel):
+    """
+    PIMMI parameters, see https://github.com/nrv/pimmi
+    @index_type: faiss index type; falls back to an exact index when there are too few points to train it
+    @sift_nfeatures: max number of SIFT points kept per image
+    @query_sift_knn: nearest neighbours retrieved for each SIFT point
+    @nb_match_ransac: min number of geometrically consistent matches to link two images
+    @algo: community detection: connected components or louvain
+    @reuse_cache: keep SIFT points between runs (plugin_data folder)
+    @nb_threads: worker processes, 0 = all CPU cores
+    """
     index_type: str = "IVF1024,Flat"
     sift_nfeatures: int = 1000
     query_sift_knn: int = 1000
     nb_match_ransac: int = 10
     algo: AlgoEnum = AlgoEnum.components
     reuse_cache: bool = True
+    nb_threads: int = 0
 
 
 class PanopticPimmi(APlugin):
@@ -33,44 +40,80 @@ class PanopticPimmi(APlugin):
     Returns clusters as groups; use Panoptic's "save clusters" button to persist them.
     """
 
-    def __init__(self, project: Project, plugin_path: str, name: str):
+    def __init__(self, name: str, project, plugin_path: str):
         super().__init__(name=name, project=project, plugin_path=plugin_path)
         self.params = PluginParams()
         self.add_action_easy(self.compute_pimmi_clusters, ['group'])
 
-    async def compute_pimmi_clusters(self, context: ActionContext):
-        instances = await self.project.get_instances(context.instance_ids)
-        sha1_to_instances = group_by_sha1(instances)
-        if not sha1_to_instances:
-            return ActionResult(notifs=[Notif(NotifType.ERROR, name="NoData", message="No instance found")])
+    def update_params(self, params):
+        # The base class copies without validation and saves the Enum as is, which is not JSON serializable.
+        data = params if isinstance(params, dict) else params.dict()
+        self.params = PluginParams(**{**self.params.dict(), **data})
+        self.project.save_params(self.params.model_dump(mode="json"))
+        return self.params
 
-        # pimmi assigns image ids in this order, so index in the list == pimmi image_id.
-        ordered = list(sha1_to_instances.items())
-        sha1s_by_id = [sha1 for sha1, _ in ordered]
-        image_paths = [insts[0].url for _, insts in ordered]
-        root = Path(os.path.commonpath(image_paths))
-        if root.is_file():
-            root = root.parent
+    def compute_pimmi_clusters(self, context: ActionContext) -> ActionResult:
+        """Group images that reuse the same visual content (copies, crops, edits) with PIMMI."""
+        if context.instance_ids:
+            instances = self.project.get_instances(id=context.instance_ids)
+        else:
+            instances = self.project.get_instances()
+        paths = self._local_paths({i.file_id for i in instances if i.file_id is not None})
 
-        sha1_by_path = {os.path.realpath(url): sha1 for sha1, url in zip(sha1s_by_id, image_paths)}
+        # Pimmi assigns image ids in this order, so the index in the list is the pimmi image_id.
+        sha1s_by_id = list(paths)
+        image_paths = list(paths.values())
+        notifs = []
+        skipped = len({i.sha1 for i in instances}) - len(sha1s_by_id)
+        if skipped:
+            notifs.append(Notif(NotifType.WARNING, name="Skipped",
+                                message=f"{skipped} images without a local file were ignored"))
+        if len(image_paths) < 2:
+            notifs.append(Notif(NotifType.ERROR, name="NoData", message="PIMMI needs at least 2 local images"))
+            return ActionResult(notifs=notifs)
+
+        try:
+            root = os.path.commonpath(image_paths)
+        except ValueError:
+            notifs.append(Notif(NotifType.ERROR, name="Paths", message="Images must be on the same drive"))
+            return ActionResult(notifs=notifs)
+        if os.path.isfile(root):
+            root = os.path.dirname(root)
 
         params = self.params.dict()
         params["algo"] = self.params.algo.value
+        params["nb_threads"] = self.params.nb_threads or os.cpu_count() or 4
 
-        clusters = await run_clustering(image_paths, sha1_by_path, str(root), str(self.data_path), params)
-        if not clusters:
-            return ActionResult(notifs=[Notif(NotifType.INFO, name="NoCluster", message="PIMMI found no cluster")])
+        sha1_by_path = {os.path.realpath(p): s for s, p in paths.items()}
+        clusters = run_clustering(image_paths, sha1_by_path, root, str(self.data_path), params)
 
-        selection = set(sha1s_by_id)
         groups = []
-        for i, cluster in enumerate(sorted(clusters.values(), key=lambda c: c["quality"], reverse=True)):
-            sha1s = [sha1s_by_id[image_id] for image_id in cluster["ids"] if 0 <= image_id < len(sha1s_by_id)]
-            sha1s = [s for s in dict.fromkeys(sha1s) if s in selection]
-            if not sha1s:
+        for cluster in sorted(clusters.values(), key=lambda c: c["quality"], reverse=True):
+            sha1s = list(dict.fromkeys(sha1s_by_id[i] for i in cluster["ids"] if 0 <= i < len(sha1s_by_id)))
+            if len(sha1s) < 2:
                 continue
             score = Score(value=cluster["quality"], min=0, max=1, max_is_best=True,
                           description="PIMMI cluster match quality")
-            groups.append(Group(sha1s=sha1s, name=f"Pimmi cluster {i}", score=score))
+            groups.append(Group(sha1s=sha1s, name=f"Pimmi cluster {len(groups)}", score=score))
 
-        notif = Notif(NotifType.INFO, name="PimmiClusters", message=f"{len(groups)} clusters found")
-        return ActionResult(groups=groups, notifs=[notif])
+        if not groups:
+            notifs.append(Notif(NotifType.INFO, name="NoCluster", message="PIMMI found no cluster"))
+            return ActionResult(notifs=notifs)
+        notifs.append(Notif(NotifType.INFO, name="PimmiClusters", message=f"{len(groups)} clusters found"))
+        return ActionResult(groups=groups, notifs=notifs)
+
+    def _local_paths(self, file_ids: set[int]) -> dict[str, str]:
+        """sha1 -> path of one existing local file showing it, resolved with a few batched queries."""
+        files = self.project.get_files(id=list(file_ids))
+        folders = {f.id: f for f in self.project.get_folders(id=list({f.folder_id for f in files}))}
+        local_sources = {s.id for s in self.project.get_file_sources() if s.dtype == 'local'}
+        paths = {}
+        for file in sorted(files, key=lambda f: f.id):
+            folder = folders.get(file.folder_id)
+            if file.sha1 in paths or not file.name or folder is None or folder.path is None \
+                    or folder.source_id not in local_sources:
+                continue
+            path = os.path.join(folder.path, file.name)
+            if os.path.isfile(path):
+                paths[file.sha1] = path
+        return paths
